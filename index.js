@@ -17,15 +17,25 @@ const pool = new Pool({
   // ssl: { rejectUnauthorized: false }, // Render/Neon gerekirse aç
 });
 
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/mevzuatlar", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT id, baslik, ozet, kaynak FROM mevzuatlar ORDER BY id DESC LIMIT 20"
+    );
+    return res.json(rows);
+  } catch (e) {
+    console.error("DB error:", e);
+    return res.status(500).json({ error: "db_error" });
+  }
+});
 
 // Şimdilik mock veri:
-app.get("/mevzuatlar", async (req, res) => {
-  return res.json([
-    { id: 1, baslik: "2025/101 Sayılı Yönetmelik", ozet: "Mock özet: Vergi usul değişikliği...", kaynak: "https://www.resmigazete.gov.tr/" },
-    { id: 2, baslik: "2025/102 Sayılı Genelge",  ozet: "Mock özet: KVKK ile ilgili güncelleme...",  kaynak: "https://www.resmigazete.gov.tr/" },
-  ]);
-});
+//app.get("/mevzuatlar", async (req, res) => {
+//  return res.json([
+//    { id: 1, baslik: "2025/101 Sayılı Yönetmelik", ozet: "Mock özet: Vergi usul değişikliği...", kaynak: "https://www.resmigazete.gov.tr/" },
+//    { id: 2, baslik: "2025/102 Sayılı Genelge",  ozet: "Mock özet: KVKK ile ilgili güncelleme...",  kaynak: "https://www.resmigazete.gov.tr/" },
+//  ]);
+//});
 
 // Test e-posta (gmail app password ile çalışır)
 app.post("/send-mail", async (req, res) => {
