@@ -149,3 +149,86 @@ app.get("/feed", async (req, res) => {
     return res.status(500).json({ error: "db_error" });
   }
 });
+
+// 1) Kayıt (yalnızca e-posta ile—MVP)
+app.post("/auth/register", async (req, res) => {
+  const { email } = req.body;
+  if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
+    return res.status(400).json({ error: "email_invalid" });
+  }
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO users (email)
+       VALUES ($1)
+       ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+       RETURNING id, email, sector, keywords, notify_pref, created_at`,
+      [email]
+    );
+    return res.json(rows[0]);
+  } catch (e) {
+    console.error("DB error (/auth/register):", e);
+    return res.status(500).json({ error: "db_error" });
+  }
+});
+
+// 2) Onboarding (sektör, keywords[], bildirim tercihi)
+app.post("/onboarding", async (req, res) => {
+  const { email, sector, keywords, notify_pref } = req.body;
+  if (!email) return res.status(400).json({ error: "email_required" });
+
+  // keywords dizi değilse dönüştürelim (MVP dayanıklılık)
+  let kw = keywords;
+  if (Array.isArray(kw) === false && typeof kw === "string") {
+    kw = kw.split(",").map((s) => s.trim()).filter(Boolean);
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `UPDATE users
+          SET sector = COALESCE($2, sector),
+              keywords = COALESCE($3, keywords),
+              notify_pref = COALESCE($4, notify_pref)
+        WHERE email = $1
+        RETURNING id, email, sector, keywords, notify_pref, created_at`,
+      [email, sector || null, Array.isArray(kw) ? kw : null, notify_pref || null]
+    );
+    if (!rows.length) return res.status(404).json({ error: "user_not_found" });
+    return res.json(rows[0]);
+  } catch (e) {
+    console.error("DB error (/onboarding):", e);
+    return res.status(500).json({ error: "db_error" });
+  }
+});
+
+// 3) Arama feed'i (q parametresi ile; yoksa son kayıtlar)
+app.get("/feed", async (req, res) => {
+  const { q } = req.query;
+  const LIMIT = 50;
+  try {
+    if (!q) {
+      const { rows } = await pool.query(
+        `SELECT id, baslik, ozet, kaynak
+           FROM mevzuatlar
+          ORDER BY id DESC
+          LIMIT $1`,
+        [LIMIT]
+      );
+      return res.json(rows);
+    } else {
+      const needle = `%${q}%`;
+      const { rows } = await pool.query(
+        `SELECT id, baslik, ozet, kaynak
+           FROM mevzuatlar
+          WHERE baslik ILIKE $1 OR ozet ILIKE $1
+          ORDER BY id DESC
+          LIMIT $2`,
+        [needle, LIMIT]
+      );
+      return res.json(rows);
+    }
+  } catch (e) {
+    console.error("DB error (/feed):", e);
+    return res.status(500).json({ error: "db_error" });
+  }
+});
+
