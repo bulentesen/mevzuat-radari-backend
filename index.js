@@ -232,3 +232,51 @@ app.get("/feed", async (req, res) => {
   }
 });
 
+// Kişisel feed: kullanıcının keywords[]'üne göre filtre
+// Örnek: GET /feed/personal?email=ornek@firma.com
+app.get("/feed/personal", async (req, res) => {
+  const { email } = req.query;
+  const LIMIT = 50;
+  if (!email) return res.status(400).json({ error: "email_required" });
+
+  try {
+    // 1) Kullanıcı bilgisi
+    const u = await pool.query(
+      "SELECT email, sector, keywords FROM users WHERE email = $1 LIMIT 1",
+      [email]
+    );
+    if (!u.rows.length) return res.status(404).json({ error: "user_not_found" });
+
+    const { keywords } = u.rows[0]; // TEXT[]; ör: {KVKK,"e-fatura"}
+
+    // 2) Anahtar kelime yoksa son kayıtlar
+    if (!keywords || !Array.isArray(keywords) || keywords.length === 0) {
+      const { rows } = await pool.query(
+        `SELECT id, baslik, ozet, kaynak
+           FROM mevzuatlar
+          ORDER BY id DESC
+          LIMIT $1`,
+        [LIMIT]
+      );
+      return res.json(rows);
+    }
+
+    // 3) ILIKE ANY ile herhangi bir kelimeyi eşle
+    const needles = keywords.map(k => `%${k}%`);
+    const { rows } = await pool.query(
+      `SELECT id, baslik, ozet, kaynak
+         FROM mevzuatlar
+        WHERE (baslik ILIKE ANY($1) OR ozet ILIKE ANY($1))
+        ORDER BY id DESC
+        LIMIT $2`,
+      [needles, LIMIT]
+    );
+
+    return res.json(rows);
+  } catch (e) {
+    console.error("DB error (/feed/personal):", e);
+    return res.status(500).json({ error: "db_error" });
+  }
+});
+
+
