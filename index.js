@@ -1,4 +1,4 @@
-// backend/index.js (v0.3)
+// backend/index.js (v0.3.1)
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
@@ -20,7 +20,7 @@ const pool = new Pool({
 });
 
 // --- Health ---
-app.get("/health", (_req, res) => res.json({ ok: true, version: "0.3" }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: "0.3.1" }));
 
 // --- Mevzuatlar (liste) ---
 app.get("/mevzuatlar", async (_req, res) => {
@@ -46,11 +46,16 @@ app.get("/feed", async (req, res) => {
   let pi = 1;
 
   if (q) {
-    conds.push(`(baslik ILIKE ANY($${pi}::text[]) OR ozet ILIKE ANY($${pi}::text[]))`);
-    // q'yu tekli dizgeye dönüştürerek ANY ile uyumlu çalıştırıyoruz
-    params.push([`%${q}%`]);
+    // ANY yerine EXISTS + unnest ile sağlamlaştırdık
+    conds.push(`EXISTS (
+      SELECT 1
+        FROM unnest(ARRAY[$${pi}]::text[]) AS pat
+       WHERE baslik ILIKE pat OR ozet ILIKE pat
+    )`);
+    params.push(`%${q}%`);
     pi++;
   }
+
   if (sector) {
     conds.push(`$${pi}::text = ANY(sectors)`);
     params.push(sector);
@@ -92,36 +97,38 @@ app.get("/feed/personal", async (req, res) => {
 
     const { sector, keywords } = u.rows[0];
 
-    // keywords yoksa: sadece sektöre göre (varsa) son kayıtlar
-    if (!keywords || !Array.isArray(keywords) || keywords.length === 0) {
-      const params = [LIMIT];
-      let sql = `
-        SELECT id, baslik, ozet, kaynak, sectors
-          FROM mevzuatlar
-      `;
-      if (sector) {
-        sql += ` WHERE $2::text = ANY(sectors)`;
-        params.push(sector);
-      }
-      sql += ` ORDER BY id DESC LIMIT $1`;
-      const { rows } = await pool.query(sql, params);
-      return res.json(rows);
-    }
+    const hasKw = Array.isArray(keywords) && keywords.length > 0;
+    const hasSector = !!sector;
 
-    // keywords varsa: ILIKE ANY + (opsiyonel) sector
-    const needles = keywords.map((k) => `%${k}%`);
+    // Dinamik SQL: EXISTS + unnest ile güvenli eşleme
     let sql = `
       SELECT id, baslik, ozet, kaynak, sectors
         FROM mevzuatlar
-       WHERE (baslik ILIKE ANY($1::text[]) OR ozet ILIKE ANY($1::text[]))
+       WHERE 1=1
     `;
-    // Parametre sırası: [needles[], (opsiyonel) sector, LIMIT]
-    const params = [needles, LIMIT];
-    if (sector) {
-      sql += ` AND $3::text = ANY(sectors)`;
-      params.splice(1, 0, sector); // [needles, sector, LIMIT]
+    const params = [];
+    let pi = 1;
+
+    if (hasKw) {
+      sql += `
+        AND EXISTS (
+          SELECT 1 FROM unnest($${pi}::text[]) AS kw
+          WHERE baslik ILIKE ('%' || kw || '%')
+             OR ozet   ILIKE ('%' || kw || '%')
+        )
+      `;
+      params.push(keywords); // text[] param
+      pi++;
     }
-    sql += ` ORDER BY id DESC LIMIT $${sector ? 3 : 2}`;
+
+    if (hasSector) {
+      sql += ` AND $${pi}::text = ANY(sectors)`;
+      params.push(sector);
+      pi++;
+    }
+
+    sql += ` ORDER BY id DESC LIMIT $${pi}`;
+    params.push(LIMIT);
 
     const { rows } = await pool.query(sql, params);
     return res.json(rows);
@@ -159,10 +166,7 @@ app.post("/onboarding", async (req, res) => {
 
   let kw = keywords;
   if (!Array.isArray(kw) && typeof kw === "string") {
-    kw = kw
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
+    kw = kw.split(",").map((s) => s.trim()).filter(Boolean);
   }
 
   try {
@@ -201,9 +205,6 @@ app.post("/admin/mevzuat", async (req, res) => {
     res.status(500).json({ error: "db_error" });
   }
 });
-
-// --- (opsiyonel) Cron skeleton kalabilir; henüz etkinleştirmedik ---
-// ... (daha önce eklediğimiz cron kodu varsa burada olabilir)
 
 const port = process.env.PORT || 5000;
 app.listen(port, () => console.log(`Backend running on :${port}`));
