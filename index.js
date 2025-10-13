@@ -1,4 +1,4 @@
-// backend/index.js (v0.3.1)
+// backend/index.js (v0.3.2 — personal feed: (keywords OR sector))
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
@@ -20,7 +20,7 @@ const pool = new Pool({
 });
 
 // --- Health ---
-app.get("/health", (_req, res) => res.json({ ok: true, version: "0.3.1" }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: "0.3.2" }));
 
 // --- Mevzuatlar (liste) ---
 app.get("/mevzuatlar", async (_req, res) => {
@@ -35,8 +35,7 @@ app.get("/mevzuatlar", async (_req, res) => {
   }
 });
 
-// --- Feed: arama + sektör ---
-// Ör: GET /feed?q=kvkk&sector=Hukuk%20Hizmetleri
+// --- Genel Feed: arama + sektör ---
 app.get("/feed", async (req, res) => {
   const { q, sector } = req.query;
   const LIMIT = 50;
@@ -46,7 +45,6 @@ app.get("/feed", async (req, res) => {
   let pi = 1;
 
   if (q) {
-    // ANY yerine EXISTS + unnest ile sağlamlaştırdık
     conds.push(`EXISTS (
       SELECT 1
         FROM unnest(ARRAY[$${pi}]::text[]) AS pat
@@ -55,7 +53,6 @@ app.get("/feed", async (req, res) => {
     params.push(`%${q}%`);
     pi++;
   }
-
   if (sector) {
     conds.push(`$${pi}::text = ANY(sectors)`);
     params.push(sector);
@@ -81,8 +78,8 @@ app.get("/feed", async (req, res) => {
   }
 });
 
-// --- Kişisel Feed: keywords + (opsiyonel) sector ---
-// Ör: GET /feed/personal?email=ornek@firma.com
+// --- Kişisel Feed: (keywords OR sector) ---
+// GET /feed/personal?email=ornek@firma.com
 app.get("/feed/personal", async (req, res) => {
   const { email } = req.query;
   const LIMIT = 50;
@@ -96,38 +93,44 @@ app.get("/feed/personal", async (req, res) => {
     if (!u.rows.length) return res.status(404).json({ error: "user_not_found" });
 
     const { sector, keywords } = u.rows[0];
-
     const hasKw = Array.isArray(keywords) && keywords.length > 0;
     const hasSector = !!sector;
 
-    // Dinamik SQL: EXISTS + unnest ile güvenli eşleme
+    // Hiç tercih yoksa: son kayıtlar
+    if (!hasKw && !hasSector) {
+      const { rows } = await pool.query(
+        `SELECT id, baslik, ozet, kaynak, sectors
+           FROM mevzuatlar
+          ORDER BY id DESC
+          LIMIT $1`,
+        [LIMIT]
+      );
+      return res.json(rows);
+    }
+
+    // OR mantığı: (kw match) OR (sector match)
     let sql = `
       SELECT id, baslik, ozet, kaynak, sectors
         FROM mevzuatlar
-       WHERE 1=1
+       WHERE
+         (
+           ${hasKw ? `EXISTS (
+             SELECT 1 FROM unnest($1::text[]) AS kw
+             WHERE baslik ILIKE ('%' || kw || '%')
+                OR ozet   ILIKE ('%' || kw || '%')
+           )` : `FALSE`}
+         )
+         OR
+         (
+           ${hasSector ? `$${hasKw ? 2 : 1}::text = ANY(sectors)` : `FALSE`}
+         )
+       ORDER BY id DESC
+       LIMIT $${hasKw && hasSector ? 3 : 2}
     `;
+
     const params = [];
-    let pi = 1;
-
-    if (hasKw) {
-      sql += `
-        AND EXISTS (
-          SELECT 1 FROM unnest($${pi}::text[]) AS kw
-          WHERE baslik ILIKE ('%' || kw || '%')
-             OR ozet   ILIKE ('%' || kw || '%')
-        )
-      `;
-      params.push(keywords); // text[] param
-      pi++;
-    }
-
-    if (hasSector) {
-      sql += ` AND $${pi}::text = ANY(sectors)`;
-      params.push(sector);
-      pi++;
-    }
-
-    sql += ` ORDER BY id DESC LIMIT $${pi}`;
+    if (hasKw) params.push(keywords);
+    if (hasSector) params.push(sector);
     params.push(LIMIT);
 
     const { rows } = await pool.query(sql, params);
