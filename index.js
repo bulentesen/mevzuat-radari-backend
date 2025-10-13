@@ -1,4 +1,4 @@
-// backend/index.js
+// backend/index.js (v0.3)
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
@@ -13,18 +13,16 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// --- Postgres Pool ---
-// Render için: DATABASE_URL External/İnternal URL'inde ?sslmode=require veya no-verify kullanın.
-// Kodda ayrıca ssl: { rejectUnauthorized:false } ile self-signed sorunlarını by-pass ediyoruz.
+// --- Postgres ---
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// --- Health check ---
-app.get("/health", (_req, res) => res.json({ ok: true, version: "0.2" }));
+// --- Health ---
+app.get("/health", (_req, res) => res.json({ ok: true, version: "0.3" }));
 
-// --- Mevzuatlar: son kayıtlar (DB'den) ---
+// --- Mevzuatlar (liste) ---
 app.get("/mevzuatlar", async (_req, res) => {
   try {
     const { rows } = await pool.query(
@@ -37,7 +35,7 @@ app.get("/mevzuatlar", async (_req, res) => {
   }
 });
 
-// --- Feed: arama + isteğe bağlı sektör filtresi ---
+// --- Feed: arama + sektör ---
 // Ör: GET /feed?q=kvkk&sector=Hukuk%20Hizmetleri
 app.get("/feed", async (req, res) => {
   const { q, sector } = req.query;
@@ -48,12 +46,13 @@ app.get("/feed", async (req, res) => {
   let pi = 1;
 
   if (q) {
-    conds.push(`(baslik ILIKE $${pi} OR ozet ILIKE $${pi})`);
-    params.push(`%${q}%`);
+    conds.push(`(baslik ILIKE ANY($${pi}::text[]) OR ozet ILIKE ANY($${pi}::text[]))`);
+    // q'yu tekli dizgeye dönüştürerek ANY ile uyumlu çalıştırıyoruz
+    params.push([`%${q}%`]);
     pi++;
   }
   if (sector) {
-    conds.push(`$${pi} = ANY(sectors)`);
+    conds.push(`$${pi}::text = ANY(sectors)`);
     params.push(sector);
     pi++;
   }
@@ -77,7 +76,7 @@ app.get("/feed", async (req, res) => {
   }
 });
 
-// --- Kişisel Feed: kullanıcının keywords[] + (varsa) sector tercihine göre ---
+// --- Kişisel Feed: keywords + (opsiyonel) sector ---
 // Ör: GET /feed/personal?email=ornek@firma.com
 app.get("/feed/personal", async (req, res) => {
   const { email } = req.query;
@@ -93,7 +92,7 @@ app.get("/feed/personal", async (req, res) => {
 
     const { sector, keywords } = u.rows[0];
 
-    // keywords boşsa sadece sektöre göre (varsa) son kayıtlar
+    // keywords yoksa: sadece sektöre göre (varsa) son kayıtlar
     if (!keywords || !Array.isArray(keywords) || keywords.length === 0) {
       const params = [LIMIT];
       let sql = `
@@ -101,7 +100,7 @@ app.get("/feed/personal", async (req, res) => {
           FROM mevzuatlar
       `;
       if (sector) {
-        sql += ` WHERE $2 = ANY(sectors)`;
+        sql += ` WHERE $2::text = ANY(sectors)`;
         params.push(sector);
       }
       sql += ` ORDER BY id DESC LIMIT $1`;
@@ -109,18 +108,18 @@ app.get("/feed/personal", async (req, res) => {
       return res.json(rows);
     }
 
-    // keywords + (opsiyonel) sector birlikte
+    // keywords varsa: ILIKE ANY + (opsiyonel) sector
     const needles = keywords.map((k) => `%${k}%`);
     let sql = `
       SELECT id, baslik, ozet, kaynak, sectors
         FROM mevzuatlar
-       WHERE (baslik ILIKE ANY($1) OR ozet ILIKE ANY($1))
+       WHERE (baslik ILIKE ANY($1::text[]) OR ozet ILIKE ANY($1::text[]))
     `;
+    // Parametre sırası: [needles[], (opsiyonel) sector, LIMIT]
     const params = [needles, LIMIT];
     if (sector) {
-      sql += ` AND $3 = ANY(sectors)`;
-      // params: [needles, sector, LIMIT]
-      params.splice(1, 0, sector);
+      sql += ` AND $3::text = ANY(sectors)`;
+      params.splice(1, 0, sector); // [needles, sector, LIMIT]
     }
     sql += ` ORDER BY id DESC LIMIT $${sector ? 3 : 2}`;
 
@@ -132,7 +131,7 @@ app.get("/feed/personal", async (req, res) => {
   }
 });
 
-// --- Auth: sadece email ile kayıt (MVP) ---
+// --- Auth (MVP) ---
 app.post("/auth/register", async (req, res) => {
   const { email } = req.body;
   if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
@@ -153,7 +152,7 @@ app.post("/auth/register", async (req, res) => {
   }
 });
 
-// --- Onboarding: sector, keywords[], notify_pref ---
+// --- Onboarding ---
 app.post("/onboarding", async (req, res) => {
   const { email, sector, keywords, notify_pref } = req.body;
   if (!email) return res.status(400).json({ error: "email_required" });
@@ -184,9 +183,7 @@ app.post("/onboarding", async (req, res) => {
   }
 });
 
-// --- Admin: Mevzuat Ekle (MVP; korumasız) ---
-// POST /admin/mevzuat
-// Body: { baslik: string, ozet?: string, kaynak?: string, sectors?: string[] }
+// --- Admin: Mevzuat Ekle (MVP) ---
 app.post("/admin/mevzuat", async (req, res) => {
   const { baslik, ozet, kaynak, sectors } = req.body;
   if (!baslik) return res.status(400).json({ error: "baslik_required" });
@@ -205,22 +202,8 @@ app.post("/admin/mevzuat", async (req, res) => {
   }
 });
 
-// --- (Opsiyonel) Mail testi endpoint'i ---
-app.post("/send-mail", async (req, res) => {
-  const { to, subject, text } = req.body;
-  try {
-    const transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS },
-    });
-    await transporter.sendMail({ from: process.env.MAIL_USER, to, subject, text });
-    res.json({ success: true });
-  } catch (e) {
-    console.error("mail_error:", e);
-    res.status(500).json({ error: "mail_error" });
-  }
-});
+// --- (opsiyonel) Cron skeleton kalabilir; henüz etkinleştirmedik ---
+// ... (daha önce eklediğimiz cron kodu varsa burada olabilir)
 
-// --- Start ---
 const port = process.env.PORT || 5000;
 app.listen(port, () => console.log(`Backend running on :${port}`));
