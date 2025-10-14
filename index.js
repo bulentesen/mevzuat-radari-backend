@@ -1,4 +1,4 @@
-// backend/index.js (v0.3.2 — personal feed: (keywords OR sector))
+// backend/index.js (v0.4 — Cron Daily Digest + Admin + Personal Feed OR logic)
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
@@ -20,7 +20,7 @@ const pool = new Pool({
 });
 
 // --- Health ---
-app.get("/health", (_req, res) => res.json({ ok: true, version: "0.3.2" }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: "0.4" }));
 
 // --- Mevzuatlar (liste) ---
 app.get("/mevzuatlar", async (_req, res) => {
@@ -45,6 +45,7 @@ app.get("/feed", async (req, res) => {
   let pi = 1;
 
   if (q) {
+    // EXISTS + unnest ile güvenli pattern eşleme
     conds.push(`EXISTS (
       SELECT 1
         FROM unnest(ARRAY[$${pi}]::text[]) AS pat
@@ -79,7 +80,6 @@ app.get("/feed", async (req, res) => {
 });
 
 // --- Kişisel Feed: (keywords OR sector) ---
-// GET /feed/personal?email=ornek@firma.com
 app.get("/feed/personal", async (req, res) => {
   const { email } = req.query;
   const LIMIT = 50;
@@ -96,7 +96,6 @@ app.get("/feed/personal", async (req, res) => {
     const hasKw = Array.isArray(keywords) && keywords.length > 0;
     const hasSector = !!sector;
 
-    // Hiç tercih yoksa: son kayıtlar
     if (!hasKw && !hasSector) {
       const { rows } = await pool.query(
         `SELECT id, baslik, ozet, kaynak, sectors
@@ -209,5 +208,95 @@ app.post("/admin/mevzuat", async (req, res) => {
   }
 });
 
+// --- Cron: Günlük Özet (MVP) ---
+// Güvenlik: ?token=CRON_TOKEN ile çağır
+app.get("/cron/daily-digest", async (req, res) => {
+  const token = req.query.token;
+  if (!token || token !== process.env.CRON_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
+  try {
+    // 1) Kullanıcılar
+    const users = await pool.query(
+      "SELECT email, sector, keywords, notify_pref FROM users"
+    );
+
+    // 2) Son mevzuatlar (MVP: son 100)
+    const mevzuat = await pool.query(
+      `SELECT id, baslik, ozet, kaynak, sectors
+         FROM mevzuatlar
+        ORDER BY id DESC
+        LIMIT 100`
+    );
+
+    // 3) Mail transporter (varsa)
+    let transporter = null;
+    if (process.env.MAIL_USER && process.env.MAIL_PASS) {
+      transporter = nodemailer.createTransport({
+        service: "gmail",
+        auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS },
+      });
+    }
+
+    // 4) Her kullanıcıya filtrele+gönder
+    let sent = 0;
+    for (const u of users.rows) {
+      // Günlük özet tercih edenleri hedefle (notify_pref boşsa da gönder, istersen burayı 'daily' şartına daralt)
+      if (u.notify_pref && u.notify_pref !== "daily") continue;
+
+      const kws = Array.isArray(u.keywords) ? u.keywords : [];
+      const sec = u.sector || null;
+
+      const matched = mevzuat.rows.filter((m) => {
+        const text = `${m.baslik} ${m.ozet || ""}`.toLowerCase();
+        const kwOk = kws.length === 0 ? true : kws.some((k) => text.includes(String(k).toLowerCase()));
+        const secOk = sec ? (Array.isArray(m.sectors) && m.sectors.includes(sec)) : true;
+        // (keywords OR sector) mantığını koruyalım
+        return kwOk || secOk;
+      });
+
+      if (matched.length === 0) continue;
+
+      const lines = matched
+        .slice(0, 20)
+        .map(
+          (m) =>
+            `• ${m.baslik}\n  ${m.ozet || "-"}\n  Kaynak: ${m.kaynak || "-"}`
+        )
+        .join("\n\n");
+
+      const subject = `Mevzuat Radarı - Günlük Özet (${matched.length} yeni)`;
+      const text =
+        `Merhaba ${u.email},\n\n` +
+        `Tercihlerinize göre son mevzuatlar:\n\n` +
+        `${lines}\n\n` +
+        `— Mevzuat Radarı`;
+
+      if (transporter) {
+        try {
+          await transporter.sendMail({
+            from: process.env.MAIL_USER,
+            to: u.email,
+            subject,
+            text,
+          });
+          sent++;
+        } catch (e) {
+          console.error(`mail_error to ${u.email}:`, e);
+        }
+      } else {
+        console.log(`[DRY-RUN] would mail to ${u.email}:\n${text}\n`);
+      }
+    }
+
+    return res.json({ ok: true, users: users.rows.length, sent });
+  } catch (e) {
+    console.error("cron_error:", e);
+    return res.status(500).json({ error: "cron_error" });
+  }
+});
+
+// --- Start ---
 const port = process.env.PORT || 5000;
 app.listen(port, () => console.log(`Backend running on :${port}`));
