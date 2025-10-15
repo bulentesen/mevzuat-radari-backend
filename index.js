@@ -1,10 +1,10 @@
-// backend/index.js (v0.4 — Cron Daily Digest + Admin + Personal Feed OR logic)
+// backend/index.js (v0.5 — SendGrid HTTP API ile e-posta + cron)
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import pkg from "pg";
-import nodemailer from "nodemailer";
+import sgMail from "@sendgrid/mail";
 
 dotenv.config();
 const { Pool } = pkg;
@@ -19,8 +19,26 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+// --- SendGrid init ---
+const HAS_SENDGRID = !!process.env.SENDGRID_API_KEY;
+if (HAS_SENDGRID) {
+  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+}
+const MAIL_FROM = process.env.MAIL_FROM || "no-reply@mevzuatradari.local";
+
+// Basit gönderim helper'ı
+async function sendMail({ to, subject, text }) {
+  if (!HAS_SENDGRID) {
+    console.log("[DRY-RUN] would mail via SendGrid:", { to, subject, text });
+    return { ok: true, dryRun: true };
+  }
+  const msg = { to, from: MAIL_FROM, subject, text };
+  await sgMail.send(msg);
+  return { ok: true };
+}
+
 // --- Health ---
-app.get("/health", (_req, res) => res.json({ ok: true, version: "0.4" }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: "0.5" }));
 
 // --- Mevzuatlar (liste) ---
 app.get("/mevzuatlar", async (_req, res) => {
@@ -45,7 +63,6 @@ app.get("/feed", async (req, res) => {
   let pi = 1;
 
   if (q) {
-    // EXISTS + unnest ile güvenli pattern eşleme
     conds.push(`EXISTS (
       SELECT 1
         FROM unnest(ARRAY[$${pi}]::text[]) AS pat
@@ -208,8 +225,19 @@ app.post("/admin/mevzuat", async (req, res) => {
   }
 });
 
-// --- Cron: Günlük Özet (MVP) ---
-// Güvenlik: ?token=CRON_TOKEN ile çağır
+// --- Mail test endpoint (SendGrid ile) ---
+app.post("/send-mail", async (req, res) => {
+  const { to, subject, text } = req.body || {};
+  try {
+    const r = await sendMail({ to, subject, text });
+    res.json({ success: true, ...r });
+  } catch (e) {
+    console.error("mail_error:", e);
+    res.status(500).json({ error: "mail_error" });
+  }
+});
+
+// --- Cron: Günlük Özet ---
 app.get("/cron/daily-digest", async (req, res) => {
   const token = req.query.token;
   if (!token || token !== process.env.CRON_TOKEN) {
@@ -217,12 +245,9 @@ app.get("/cron/daily-digest", async (req, res) => {
   }
 
   try {
-    // 1) Kullanıcılar
     const users = await pool.query(
       "SELECT email, sector, keywords, notify_pref FROM users"
     );
-
-    // 2) Son mevzuatlar (MVP: son 100)
     const mevzuat = await pool.query(
       `SELECT id, baslik, ozet, kaynak, sectors
          FROM mevzuatlar
@@ -230,19 +255,8 @@ app.get("/cron/daily-digest", async (req, res) => {
         LIMIT 100`
     );
 
-    // 3) Mail transporter (varsa)
-    let transporter = null;
-    if (process.env.MAIL_USER && process.env.MAIL_PASS) {
-      transporter = nodemailer.createTransport({
-        service: "gmail",
-        auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS },
-      });
-    }
-
-    // 4) Her kullanıcıya filtrele+gönder
     let sent = 0;
     for (const u of users.rows) {
-      // Günlük özet tercih edenleri hedefle (notify_pref boşsa da gönder, istersen burayı 'daily' şartına daralt)
       if (u.notify_pref && u.notify_pref !== "daily") continue;
 
       const kws = Array.isArray(u.keywords) ? u.keywords : [];
@@ -250,10 +264,14 @@ app.get("/cron/daily-digest", async (req, res) => {
 
       const matched = mevzuat.rows.filter((m) => {
         const text = `${m.baslik} ${m.ozet || ""}`.toLowerCase();
-        const kwOk = kws.length === 0 ? true : kws.some((k) => text.includes(String(k).toLowerCase()));
-        const secOk = sec ? (Array.isArray(m.sectors) && m.sectors.includes(sec)) : true;
-        // (keywords OR sector) mantığını koruyalım
-        return kwOk || secOk;
+        const kwOk =
+          kws.length === 0
+            ? true
+            : kws.some((k) => text.includes(String(k).toLowerCase()));
+        const secOk = sec
+          ? Array.isArray(m.sectors) && m.sectors.includes(sec)
+          : true;
+        return kwOk || secOk; // OR mantığı
       });
 
       if (matched.length === 0) continue;
@@ -273,24 +291,15 @@ app.get("/cron/daily-digest", async (req, res) => {
         `${lines}\n\n` +
         `— Mevzuat Radarı`;
 
-      if (transporter) {
-        try {
-          await transporter.sendMail({
-            from: process.env.MAIL_USER,
-            to: u.email,
-            subject,
-            text,
-          });
-          sent++;
-        } catch (e) {
-          console.error(`mail_error to ${u.email}:`, e);
-        }
-      } else {
-        console.log(`[DRY-RUN] would mail to ${u.email}:\n${text}\n`);
+      try {
+        await sendMail({ to: u.email, subject, text });
+        sent++;
+      } catch (e) {
+        console.error(`mail_error to ${u.email}:`, e);
       }
     }
 
-    return res.json({ ok: true, users: users.rows.length, sent });
+    return res.json({ ok: true, users: users.rows.length, sent, via: HAS_SENDGRID ? "sendgrid" : "dry-run" });
   } catch (e) {
     console.error("cron_error:", e);
     return res.status(500).json({ error: "cron_error" });
