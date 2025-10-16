@@ -1,4 +1,4 @@
-// backend/index.js (v0.5 — SendGrid HTTP API ile e-posta + cron)
+// backend/index.js (v0.6)
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
@@ -13,34 +13,34 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// --- Postgres ---
+// ---------- Postgres ----------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// --- SendGrid init ---
+// ---------- SendGrid (HTTP API) ----------
 const HAS_SENDGRID = !!process.env.SENDGRID_API_KEY;
 if (HAS_SENDGRID) {
   sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 }
 const MAIL_FROM = process.env.MAIL_FROM || "no-reply@mevzuatradari.local";
 
-// Basit gönderim helper'ı
-async function sendMail({ to, subject, text }) {
+// Ortak mail helper (HTML destekli)
+async function sendMail({ to, subject, text, html }) {
   if (!HAS_SENDGRID) {
-    console.log("[DRY-RUN] would mail via SendGrid:", { to, subject, text });
+    console.log("[DRY-RUN] would mail", { to, subject, text, html: !!html });
     return { ok: true, dryRun: true };
   }
-  const msg = { to, from: MAIL_FROM, subject, text };
+  const msg = { to, from: MAIL_FROM, subject, text: text || "", html };
   await sgMail.send(msg);
   return { ok: true };
 }
 
-// --- Health ---
-app.get("/health", (_req, res) => res.json({ ok: true, version: "0.5" }));
+// ---------- Health ----------
+app.get("/health", (_req, res) => res.json({ ok: true, version: "0.6" }));
 
-// --- Mevzuatlar (liste) ---
+// ---------- Mevzuatlar (liste) ----------
 app.get("/mevzuatlar", async (_req, res) => {
   try {
     const { rows } = await pool.query(
@@ -53,7 +53,7 @@ app.get("/mevzuatlar", async (_req, res) => {
   }
 });
 
-// --- Genel Feed: arama + sektör ---
+// ---------- Genel Feed: arama + sektör ----------
 app.get("/feed", async (req, res) => {
   const { q, sector } = req.query;
   const LIMIT = 50;
@@ -63,6 +63,7 @@ app.get("/feed", async (req, res) => {
   let pi = 1;
 
   if (q) {
+    // EXISTS + unnest ile güvenli pattern eşleme
     conds.push(`EXISTS (
       SELECT 1
         FROM unnest(ARRAY[$${pi}]::text[]) AS pat
@@ -96,7 +97,7 @@ app.get("/feed", async (req, res) => {
   }
 });
 
-// --- Kişisel Feed: (keywords OR sector) ---
+// ---------- Kişisel Feed: (keywords OR sector) ----------
 app.get("/feed/personal", async (req, res) => {
   const { email } = req.query;
   const LIMIT = 50;
@@ -157,7 +158,7 @@ app.get("/feed/personal", async (req, res) => {
   }
 });
 
-// --- Auth (MVP) ---
+// ---------- Auth (MVP) + Hoş geldin maili ----------
 app.post("/auth/register", async (req, res) => {
   const { email } = req.body;
   if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
@@ -171,14 +172,40 @@ app.post("/auth/register", async (req, res) => {
        RETURNING id, email, sector, keywords, notify_pref, created_at`,
       [email]
     );
-    return res.json(rows[0]);
+    const user = rows[0];
+
+    // Hoş geldin maili (fire-and-forget)
+    try {
+      await sendMail({
+        to: email,
+        subject: "Mevzuat Radarı - Hoş Geldiniz",
+        text:
+`Merhaba ${email},
+
+Mevzuat Radarı sistemine hoş geldiniz! 🎉
+Bundan sonra seçtiğiniz sektör ve anahtar kelimelere göre özetler alacaksınız.
+
+Selamlar,
+Mevzuat Radarı Ekibi`,
+        html:
+`<p>Merhaba <b>${email}</b>,</p>
+<p>Mevzuat Radarı sistemine <b>hoş geldiniz!</b> 🎉</p>
+<p>Seçtiğiniz sektör ve anahtar kelimelere göre özetleri e-posta ile alacaksınız.</p>
+<p>Selamlar,<br/>Mevzuat Radarı Ekibi</p>`
+      });
+      console.log(`welcome_mail sent to ${email}`);
+    } catch (err) {
+      console.error("welcome_mail_error:", err);
+    }
+
+    return res.json(user);
   } catch (e) {
     console.error("DB error (/auth/register):", e);
     return res.status(500).json({ error: "db_error" });
   }
 });
 
-// --- Onboarding ---
+// ---------- Onboarding ----------
 app.post("/onboarding", async (req, res) => {
   const { email, sector, keywords, notify_pref } = req.body;
   if (!email) return res.status(400).json({ error: "email_required" });
@@ -206,7 +233,7 @@ app.post("/onboarding", async (req, res) => {
   }
 });
 
-// --- Admin: Mevzuat Ekle (MVP) ---
+// ---------- Admin: Mevzuat Ekle (MVP) ----------
 app.post("/admin/mevzuat", async (req, res) => {
   const { baslik, ozet, kaynak, sectors } = req.body;
   if (!baslik) return res.status(400).json({ error: "baslik_required" });
@@ -225,11 +252,11 @@ app.post("/admin/mevzuat", async (req, res) => {
   }
 });
 
-// --- Mail test endpoint (SendGrid ile) ---
+// ---------- Mail test endpoint ----------
 app.post("/send-mail", async (req, res) => {
-  const { to, subject, text } = req.body || {};
+  const { to, subject, text, html } = req.body || {};
   try {
-    const r = await sendMail({ to, subject, text });
+    const r = await sendMail({ to, subject, text, html });
     res.json({ success: true, ...r });
   } catch (e) {
     console.error("mail_error:", e);
@@ -237,7 +264,7 @@ app.post("/send-mail", async (req, res) => {
   }
 });
 
-// --- Cron: Günlük Özet ---
+// ---------- Cron: Günlük Özet ----------
 app.get("/cron/daily-digest", async (req, res) => {
   const token = req.query.token;
   if (!token || token !== process.env.CRON_TOKEN) {
@@ -306,6 +333,6 @@ app.get("/cron/daily-digest", async (req, res) => {
   }
 });
 
-// --- Start ---
+// ---------- Start ----------
 const port = process.env.PORT || 5000;
 app.listen(port, () => console.log(`Backend running on :${port}`));
